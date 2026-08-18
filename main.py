@@ -10,6 +10,7 @@ from discord.ext import commands
 
 COMMAND_PREFIX = "!"
 POLL_CHANNEL_ID = 1445760622762655898
+RESULT_CHANNEL_ID = 1396886120356118718  # 投稿先のチャネルID（Noneにするとコマンドを実行したチャネルに送信）
 
 # 4人組スタートの基準日（2026年8月13日）
 BASE_DATE = datetime.date(2026, 8, 13)
@@ -76,7 +77,6 @@ def create_bot() -> commands.Bot:
             size = None
 
             if arg1 is None:
-                # 2週間ごとの自動判定（0〜13日目: 4人組、14〜27日目: 2人組）
                 today = datetime.date.today()
                 days_diff = (today - BASE_DATE).days
                 period_index = days_diff // 14
@@ -147,7 +147,19 @@ def create_bot() -> commands.Bot:
                 else:
                     result += f"**チーム {i}（余り {len(t)}名）**: {' & '.join(t)}\n"
 
-            await ctx.send(result)
+            # 投稿先チャネルの取得・指定
+            dest_channel = ctx
+            if RESULT_CHANNEL_ID is not None:
+                target = bot.get_channel(RESULT_CHANNEL_ID)
+                if target is None:
+                    try:
+                        target = await bot.fetch_channel(RESULT_CHANNEL_ID)
+                    except Exception:
+                        pass
+                if target:
+                    dest_channel = target
+
+            await dest_channel.send(result)
 
         except Exception as e:
             await ctx.send(f"エラーが発生しました: {e}")
