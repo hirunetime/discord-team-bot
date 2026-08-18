@@ -112,19 +112,30 @@ async def run_team_division(bot: commands.Bot, size: int = None) -> tuple[bool, 
             title="🎲 チーム分け結果",
             color=0x3498db
         )
-        embed.add_field(
-            name="📋 条件",
-            value=f"**形式:** {size}人組  |  **対象:** {target_text}  |  **人数:** 計{len(members)}名",
-            inline=False
-        )
 
+        # 条件のミニカード表示（インライン）
+        embed.add_field(name="形式", value=f"{size}人組", inline=True)
+        embed.add_field(name="対象", value=target_text, inline=True)
+        embed.add_field(name="参加人数", value=f"計 {len(members)} 名", inline=True)
+
+        # チームごとの一覧（引用マークで確実にインデント＋透明フィールドで改行）
         for i, t in enumerate(teams, 1):
-            team_title = f"チーム {i}" if len(t) == size else f"チーム {i}（余り {len(t)}名）"
+            is_full = (len(t) == size)
+            icon = "👥" if is_full else "⚠️"
+            team_title = f"{icon} チーム {i}" if is_full else f"{icon} チーム {i}（余り {len(t)}名）"
+            
+            # 引用記号 (>) を使って文字を下げる（インデント化）
+            member_list = "\n".join([f"> {m}" for m in t])
+            
             embed.add_field(
-                name=f"🔹 {team_title}",
-                value=" ・ ".join(t),
+                name=team_title,
+                value=member_list,
                 inline=False
             )
+            
+            # 最後のチーム以外には「透明な空フィールド」を入れてチーム間に空行（間隔）を作る
+            if i < len(teams):
+                embed.add_field(name="\u200b", value="\u200b", inline=False)
 
         # 指定チャネルへの投稿
         dest_channel = bot.get_channel(RESULT_CHANNEL_ID)
