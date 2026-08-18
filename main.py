@@ -151,7 +151,7 @@ async def start_web_server():
     app.router.add_get("/", handle)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = 1000
+    port = 10000
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
