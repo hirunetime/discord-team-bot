@@ -93,7 +93,7 @@ def create_bot() -> commands.Bot:
                 if channel is None:
                     channel = await bot.fetch_channel(POLL_CHANNEL_ID)
 
-                async for message in channel.history(limit=50):
+                async for message in channel.history(limit=200):
                     if message.poll:
                         target_msg = message
                         break
