@@ -10,10 +10,13 @@ from discord.ext import commands
 
 COMMAND_PREFIX = "!"
 POLL_CHANNEL_ID = 1445760622762655898
-RESULT_CHANNEL_ID = 1396886120356118718  # 投稿先のチャネルID（Noneにするとコマンドを実行したチャネルに送信）
+RESULT_CHANNEL_ID = 1396886120356118718  # 指定の投稿先チャネルID
 
 # 4人組スタートの基準日（2026年8月13日）
 BASE_DATE = datetime.date(2026, 8, 13)
+
+# 外部からの誤呼び出しを防ぐためのトークン（Renderの環境変数 "API_SECRET_TOKEN" に設定）
+API_SECRET_TOKEN = os.environ.get("API_SECRET_TOKEN", "default_secret_key")
 
 
 async def get_poll_answer_users(answer) -> list[discord.User | discord.Member]:
@@ -51,6 +54,80 @@ async def get_poll_answer_users(answer) -> list[discord.User | discord.Member]:
     )
 
 
+async def run_team_division(bot: commands.Bot, size: int = None) -> tuple[bool, str]:
+    """チーム分けを実行し、結果を指定チャネルへ送信するコア関数"""
+    try:
+        # 人数が指定されていない場合は自動判定（2週間周期）
+        if size is None:
+            today = datetime.date.today()
+            days_diff = (today - BASE_DATE).days
+            period_index = days_diff // 14
+            size = 2 if (period_index % 2 == 1) else 4
+
+        if size < 1:
+            return False, "チーム人数は1人以上に指定してください。"
+
+        # アンケートメッセージの取得
+        channel = bot.get_channel(POLL_CHANNEL_ID)
+        if channel is None:
+            channel = await bot.fetch_channel(POLL_CHANNEL_ID)
+
+        target_msg = None
+        async for message in channel.history(limit=200):
+            if message.poll:
+                target_msg = message
+                break
+
+        if target_msg is None or not target_msg.poll:
+            return False, "アンケートチャネルに有効な投票メッセージが見つかりませんでした。"
+
+        # 投票回答の特定
+        target_answer = None
+        for ans in target_msg.poll.answers:
+            text = getattr(ans, "text", "") or ""
+            if not text and hasattr(ans, "media") and hasattr(ans.media, "text"):
+                text = ans.media.text or ""
+
+            if "参加" in text and "不参加" not in text:
+                target_answer = ans
+                break
+
+        if not target_answer:
+            target_answer = target_msg.poll.answers[0]
+
+        # ユーザー取得とシャッフル
+        raw_users = await get_poll_answer_users(target_answer)
+        members = [u.mention for u in raw_users if not u.bot]
+
+        if not members:
+            target_text = getattr(target_answer, "text", "参加")
+            return False, f"「{target_text}」に投票したユーザーがいません。"
+
+        random.shuffle(members)
+        teams = [members[i:i + size] for i in range(0, len(members), size)]
+
+        # 結果テキストの整形
+        target_text = getattr(target_answer, "text", "参加")
+        result = f"**【チーム分け結果】（{size}人組 / 対象: {target_text} / 計{len(members)}名）**\n"
+        for i, t in enumerate(teams, 1):
+            if len(t) == size:
+                result += f"**チーム {i}**: {' & '.join(t)}\n"
+            else:
+                result += f"**チーム {i}（余り {len(t)}名）**: {' & '.join(t)}\n"
+
+        # 指定チャネルへの投稿
+        dest_channel = bot.get_channel(RESULT_CHANNEL_ID)
+        if dest_channel is None:
+            dest_channel = await bot.fetch_channel(RESULT_CHANNEL_ID)
+
+        await dest_channel.send(result)
+        return True, "チーム分け結果を送信しました。"
+
+    except Exception as e:
+        logging.error("チーム分け実行エラー: %s", e)
+        return False, f"エラーが発生しました: {e}"
+
+
 def create_bot() -> commands.Bot:
     intents = discord.Intents.default()
     intents.message_content = True
@@ -72,108 +149,41 @@ def create_bot() -> commands.Bot:
         arg1: str = None,
         arg2: int = None
     ) -> None:
-        try:
-            target_msg = None
-            size = None
+        size = None
+        if arg1 is not None and arg1.isdigit() and len(arg1) <= 2:
+            size = int(arg1)
+        elif arg2 is not None:
+            size = arg2
 
-            if arg1 is None:
-                today = datetime.date.today()
-                days_diff = (today - BASE_DATE).days
-                period_index = days_diff // 14
-                size = 2 if (period_index % 2 == 1) else 4
-            elif arg1.isdigit() and len(arg1) <= 2:
-                size = int(arg1)
-            else:
-                try:
-                    converter = commands.MessageConverter()
-                    target_msg = await converter.convert(ctx, arg1)
-                except Exception:
-                    pass
-                if arg2 is not None:
-                    size = arg2
-                else:
-                    today = datetime.date.today()
-                    days_diff = (today - BASE_DATE).days
-                    period_index = days_diff // 14
-                    size = 2 if (period_index % 2 == 1) else 4
-
-            if size < 1:
-                await ctx.send("チーム人数は1人以上に指定してください。")
-                return
-
-            if target_msg is None:
-                channel = bot.get_channel(POLL_CHANNEL_ID)
-                if channel is None:
-                    channel = await bot.fetch_channel(POLL_CHANNEL_ID)
-
-                async for message in channel.history(limit=200):
-                    if message.poll:
-                        target_msg = message
-                        break
-
-            if target_msg is None or not target_msg.poll:
-                await ctx.send("アンケートチャネルに有効な投票メッセージが見つかりませんでした。")
-                return
-
-            target_answer = None
-            for ans in target_msg.poll.answers:
-                text = getattr(ans, "text", "") or ""
-                if not text and hasattr(ans, "media") and hasattr(ans.media, "text"):
-                    text = ans.media.text or ""
-
-                if "参加" in text and "不参加" not in text:
-                    target_answer = ans
-                    break
-
-            if not target_answer:
-                target_answer = target_msg.poll.answers[0]
-
-            raw_users = await get_poll_answer_users(target_answer)
-            members = [u.mention for u in raw_users if not u.bot]
-
-            if not members:
-                target_text = getattr(target_answer, "text", "参加")
-                await ctx.send(f"「{target_text}」に投票したユーザーがいません。")
-                return
-
-            random.shuffle(members)
-            teams = [members[i:i + size] for i in range(0, len(members), size)]
-
-            target_text = getattr(target_answer, "text", "参加")
-            result = f"**【チーム分け結果】（{size}人組 / 対象: {target_text} / 計{len(members)}名）**\n"
-            for i, t in enumerate(teams, 1):
-                if len(t) == size:
-                    result += f"**チーム {i}**: {' & '.join(t)}\n"
-                else:
-                    result += f"**チーム {i}（余り {len(t)}名）**: {' & '.join(t)}\n"
-
-            # 投稿先チャネルの取得・指定
-            dest_channel = ctx
-            if RESULT_CHANNEL_ID is not None:
-                target = bot.get_channel(RESULT_CHANNEL_ID)
-                if target is None:
-                    try:
-                        target = await bot.fetch_channel(RESULT_CHANNEL_ID)
-                    except Exception:
-                        pass
-                if target:
-                    dest_channel = target
-
-            await dest_channel.send(result)
-
-        except Exception as e:
-            await ctx.send(f"エラーが発生しました: {e}")
+        success, msg = await run_team_division(bot, size=size)
+        if not success:
+            await ctx.send(msg)
 
     return bot
 
 
-async def start_web_server():
-    """Renderのヘルスチェックをパスするための軽量Webサーバー"""
-    async def handle(request):
+async def start_web_server(bot: commands.Bot):
+    """APIリクエストを受け付けるWebサーバー"""
+    async def handle_health(request):
         return web.Response(text="Bot is running!")
 
+    async def handle_api_team(request):
+        # APIトークンの検証
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header != f"Bearer {API_SECRET_TOKEN}":
+            return web.json_response({"status": "error", "message": "Unauthorized"}, status=401)
+
+        # チーム分けの実行
+        success, msg = await run_team_division(bot)
+        if success:
+            return web.json_response({"status": "success", "message": msg})
+        else:
+            return web.json_response({"status": "error", "message": msg}, status=400)
+
     app = web.Application()
-    app.router.add_get("/", handle)
+    app.router.add_get("/", handle_health)
+    app.router.add_post("/api/team", handle_api_team)
+
     runner = web.AppRunner(app)
     await runner.setup()
     port = 10000
@@ -191,8 +201,8 @@ async def main_async() -> None:
     if not token:
         raise RuntimeError("DISCORD_BOT_TOKEN is not configured.")
 
-    await start_web_server()
     bot = create_bot()
+    await start_web_server(bot)
     await bot.start(token)
 
 
