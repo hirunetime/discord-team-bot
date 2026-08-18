@@ -15,7 +15,7 @@ RESULT_CHANNEL_ID = 1396886120356118718  # 指定の投稿先チャネルID
 # 4人組スタートの基準日（2026年8月13日）
 BASE_DATE = datetime.date(2026, 8, 13)
 
-# 外部からの誤呼び出しを防ぐためのトークン（Renderの環境変数 "API_SECRET_TOKEN" に設定）
+# 外部からの誤呼び出しを防ぐためのトークン
 API_SECRET_TOKEN = os.environ.get("API_SECRET_TOKEN", "default_secret_key")
 
 
@@ -55,7 +55,7 @@ async def get_poll_answer_users(answer) -> list[discord.User | discord.Member]:
 
 
 async def run_team_division(bot: commands.Bot, size: int = None) -> tuple[bool, str]:
-    """チーム分けを実行し、結果を指定チャネルへ送信するコア関数"""
+    """チーム分けを実行し、Embed形式で指定チャネルへ送信するコア関数"""
     try:
         # 人数が指定されていない場合は自動判定（2週間周期）
         if size is None:
@@ -106,21 +106,32 @@ async def run_team_division(bot: commands.Bot, size: int = None) -> tuple[bool, 
         random.shuffle(members)
         teams = [members[i:i + size] for i in range(0, len(members), size)]
 
-        # 結果テキストの整形
+        # Embedメッセージの整形
         target_text = getattr(target_answer, "text", "参加")
-        result = f"**【チーム分け結果】（{size}人組 / 対象: {target_text} / 計{len(members)}名）**\n"
+        embed = discord.Embed(
+            title="🎲 チーム分け結果",
+            color=0x3498db
+        )
+        embed.add_field(
+            name="📋 条件",
+            value=f"**形式:** {size}人組  |  **対象:** {target_text}  |  **人数:** 計{len(members)}名",
+            inline=False
+        )
+
         for i, t in enumerate(teams, 1):
-            if len(t) == size:
-                result += f"**チーム {i}**: {' & '.join(t)}\n"
-            else:
-                result += f"**チーム {i}（余り {len(t)}名）**: {' & '.join(t)}\n"
+            team_title = f"チーム {i}" if len(t) == size else f"チーム {i}（余り {len(t)}名）"
+            embed.add_field(
+                name=f"🔹 {team_title}",
+                value=" ・ ".join(t),
+                inline=False
+            )
 
         # 指定チャネルへの投稿
         dest_channel = bot.get_channel(RESULT_CHANNEL_ID)
         if dest_channel is None:
             dest_channel = await bot.fetch_channel(RESULT_CHANNEL_ID)
 
-        await dest_channel.send(result)
+        await dest_channel.send(embed=embed)
         return True, "チーム分け結果を送信しました。"
 
     except Exception as e:
@@ -168,12 +179,10 @@ async def start_web_server(bot: commands.Bot):
         return web.Response(text="Bot is running!")
 
     async def handle_api_team(request):
-        # APIトークンの検証
         auth_header = request.headers.get("Authorization", "")
         if auth_header != f"Bearer {API_SECRET_TOKEN}":
             return web.json_response({"status": "error", "message": "Unauthorized"}, status=401)
 
-        # チーム分けの実行
         success, msg = await run_team_division(bot)
         if success:
             return web.json_response({"status": "success", "message": msg})
