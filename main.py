@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import logging
 import os
 import random
@@ -9,6 +10,9 @@ from discord.ext import commands
 
 COMMAND_PREFIX = "!"
 POLL_CHANNEL_ID = 1445760622762655898
+
+# 4人組スタートの基準日（2026年8月13日）
+BASE_DATE = datetime.date(2026, 8, 13)
 
 
 async def get_poll_answer_users(answer) -> list[discord.User | discord.Member]:
@@ -69,10 +73,14 @@ def create_bot() -> commands.Bot:
     ) -> None:
         try:
             target_msg = None
-            size = 2
+            size = None
 
             if arg1 is None:
-                size = 2
+                # 2週間ごとの自動判定（0〜13日目: 4人組、14〜27日目: 2人組）
+                today = datetime.date.today()
+                days_diff = (today - BASE_DATE).days
+                period_index = days_diff // 14
+                size = 2 if (period_index % 2 == 1) else 4
             elif arg1.isdigit() and len(arg1) <= 2:
                 size = int(arg1)
             else:
@@ -83,6 +91,11 @@ def create_bot() -> commands.Bot:
                     pass
                 if arg2 is not None:
                     size = arg2
+                else:
+                    today = datetime.date.today()
+                    days_diff = (today - BASE_DATE).days
+                    period_index = days_diff // 14
+                    size = 2 if (period_index % 2 == 1) else 4
 
             if size < 1:
                 await ctx.send("チーム人数は1人以上に指定してください。")
