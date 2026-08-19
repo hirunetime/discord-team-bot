@@ -67,6 +67,13 @@ async def run_team_division(bot: commands.Bot, size: int = None) -> tuple[bool, 
         if size < 1:
             return False, "チーム人数は1人以上に指定してください。"
 
+        # 投稿先チャネルとGuild(サーバー)の取得
+        dest_channel = bot.get_channel(RESULT_CHANNEL_ID)
+        if dest_channel is None:
+            dest_channel = await bot.fetch_channel(RESULT_CHANNEL_ID)
+        
+        guild = dest_channel.guild
+
         # アンケートメッセージの取得
         channel = bot.get_channel(POLL_CHANNEL_ID)
         if channel is None:
@@ -95,9 +102,27 @@ async def run_team_division(bot: commands.Bot, size: int = None) -> tuple[bool, 
         if not target_answer:
             target_answer = target_msg.poll.answers[0]
 
-        # ユーザー取得とシャッフル
+        # ユーザー取得
         raw_users = await get_poll_answer_users(target_answer)
-        members = [u.mention for u in raw_users if not u.bot]
+        
+        # UserオブジェクトをサーバーのMemberオブジェクトに変換してメンション化
+        members = []
+        for u in raw_users:
+            if u.bot:
+                continue
+
+            # 1. キャッシュからMemberを取得
+            member = guild.get_member(u.id)
+            
+            # 2. キャッシュになければAPIから取得
+            if member is None:
+                try:
+                    member = await guild.fetch_member(u.id)
+                except discord.HTTPException:
+                    member = u  # 取得失敗時はフォールバック
+
+            # Memberオブジェクトのメンションを使用（通知が飛び、名前で表示される）
+            members.append(member.mention)
 
         if not members:
             target_text = getattr(target_answer, "text", "参加")
@@ -106,13 +131,12 @@ async def run_team_division(bot: commands.Bot, size: int = None) -> tuple[bool, 
         random.shuffle(members)
         teams = [members[i:i + size] for i in range(0, len(members), size)]
 
-        # Embedメッセージの整形（タイトルに人数条件を配置）
+        # Embedメッセージの整形
         embed = discord.Embed(
             title=f"🎲 チーム分け結果（{size}人組）",
             color=0x3498db
         )
 
-        # チームごとの一覧（引用記号インデント・余計な空フィールド削除）
         for i, t in enumerate(teams, 1):
             is_full = (len(t) == size)
             icon = "👥" if is_full else "⚠️"
@@ -127,10 +151,6 @@ async def run_team_division(bot: commands.Bot, size: int = None) -> tuple[bool, 
             )
 
         # 指定チャネルへの投稿
-        dest_channel = bot.get_channel(RESULT_CHANNEL_ID)
-        if dest_channel is None:
-            dest_channel = await bot.fetch_channel(RESULT_CHANNEL_ID)
-
         await dest_channel.send(embed=embed)
         return True, "チーム分け結果を送信しました。"
 
@@ -142,6 +162,7 @@ async def run_team_division(bot: commands.Bot, size: int = None) -> tuple[bool, 
 def create_bot() -> commands.Bot:
     intents = discord.Intents.default()
     intents.message_content = True
+    intents.members = True  # サーバーメンバー情報取得インテントを有効化
 
     bot = commands.Bot(
         command_prefix=COMMAND_PREFIX,
