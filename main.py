@@ -105,7 +105,7 @@ async def run_team_division(bot: commands.Bot, size: int = None) -> tuple[bool, 
         # ユーザー取得
         raw_users = await get_poll_answer_users(target_answer)
         
-        # UserオブジェクトをサーバーのMemberオブジェクトに変換してメンション化
+        # Memberオブジェクトから「サーバー表示名（ニックネーム）」文字列を取得
         members = []
         for u in raw_users:
             if u.bot:
@@ -118,11 +118,15 @@ async def run_team_division(bot: commands.Bot, size: int = None) -> tuple[bool, 
             if member is None:
                 try:
                     member = await guild.fetch_member(u.id)
-                except discord.HTTPException:
-                    member = u  # 取得失敗時はフォールバック
+                except Exception as e:
+                    logging.warning("Member取得失敗 (ID: %s): %s", u.id, e)
+                    member = u  # 取得失敗時はUserのままフォールバック
 
-            # Memberオブジェクトのメンションを使用（通知が飛び、名前で表示される）
-            members.append(member.mention)
+            # サーバー表示名（ニックネーム優先、無ければユーザー名）を取得
+            display_name = getattr(member, "display_name", getattr(member, "name", str(u.id)))
+
+            # 純粋なテキスト名のみ保持
+            members.append(display_name)
 
         if not members:
             target_text = getattr(target_answer, "text", "参加")
@@ -150,8 +154,8 @@ async def run_team_division(bot: commands.Bot, size: int = None) -> tuple[bool, 
                 inline=False
             )
 
-        # 指定チャネルへの投稿
-        await dest_channel.send(embed=embed)
+        # 指定チャネルへの投稿（@everyoneメンションを先頭に付けて送信）
+        await dest_channel.send(content="@everyone", embed=embed)
         return True, "チーム分け結果を送信しました。"
 
     except Exception as e:
@@ -162,7 +166,7 @@ async def run_team_division(bot: commands.Bot, size: int = None) -> tuple[bool, 
 def create_bot() -> commands.Bot:
     intents = discord.Intents.default()
     intents.message_content = True
-    intents.members = True  # サーバーメンバー情報取得インテントを有効化
+    intents.members = True  # サーバーでの表示名（ニックネーム）取得用
 
     bot = commands.Bot(
         command_prefix=COMMAND_PREFIX,
