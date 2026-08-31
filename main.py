@@ -13,7 +13,7 @@ POLL_CHANNEL_ID = 1445760622762655898
 RESULT_CHANNEL_ID = 1396886120356118718  # 指定の投稿先チャネルID
 
 # 4人組スタートの基準日
-BASE_DATE = datetime.date(2026, 8, 24)
+BASE_DATE = datetime.date(2026, 8, 10)
 
 # 外部からの誤呼び出しを防ぐためのトークン
 API_SECRET_TOKEN = os.environ.get("API_SECRET_TOKEN", "default_secret_key")
