@@ -217,14 +217,13 @@ async def start_web_server(bot: commands.Bot):
         else:
             return web.json_response({"status": "error", "message": msg}, status=400)
 
-    # 要約API用：BotがDiscordに接続済みか確認
+    # 👇 ここから要約API用
     async def handle_api_ready(request):
         if not bot.is_ready():
             return web.json_response({"status": "not_ready"}, status=503)
 
         return web.json_response({"status": "ready"})
 
-    # 要約API
     async def handle_api_summary(request):
         auth_header = request.headers.get("Authorization", "")
 
@@ -266,6 +265,16 @@ async def start_web_server(bot: commands.Bot):
             if channel is None:
                 channel = await bot.fetch_channel(channel_id)
 
+            # スレッドは対象外
+            if isinstance(channel, discord.Thread):
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "message": "スレッドは要約対象外です"
+                    },
+                    status=400
+                )
+
             # Guild確認
             channel_guild = getattr(channel, "guild", None)
 
@@ -287,23 +296,46 @@ async def start_web_server(bot: commands.Bot):
                     status=400
                 )
 
-            # 接続テストとして、元の実行チャンネルへ投稿
-            await channel.send(
-                "要約処理の接続テストです。\n"
-                "Renderからこのチャンネルへの投稿に成功しました。"
-            )
+            # 実行時刻から12時間前
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            cutoff_time = now_utc - datetime.timedelta(hours=12)
+
+            messages = []
+
+            # Discordの履歴を古い順に取得
+            async for message in channel.history(
+                limit=None,
+                after=cutoff_time,
+                oldest_first=True
+            ):
+                # Botの投稿は除外
+                if message.author.bot:
+                    continue
+
+                # 通常のDiscordメッセージだけ対象
+                if message.type != discord.MessageType.default:
+                    continue
+
+                messages.append(message)
 
             logging.info(
-                "要約API接続テスト成功: request_id=%s channel_id=%s",
+                "直近12時間の対象メッセージ取得: request_id=%s count=%d",
                 request_id,
-                channel_id
+                len(messages)
+            )
+
+            # テスト用投稿
+            await channel.send(
+                f"直近12時間のメッセージ取得テストです。\n"
+                f"対象メッセージを {len(messages)} 件取得しました。"
             )
 
             return web.json_response(
                 {
                     "status": "success",
-                    "message": "Discordへの投稿に成功しました",
-                    "request_id": request_id
+                    "message": "直近12時間のメッセージ取得に成功しました",
+                    "request_id": request_id,
+                    "message_count": len(messages)
                 }
             )
 
@@ -318,11 +350,10 @@ async def start_web_server(bot: commands.Bot):
                 status=500
             )
 
+    # 👇 ルーティングの設定とサーバー起動
     app = web.Application()
     app.router.add_get("/", handle_health)
     app.router.add_post("/api/team", handle_api_team)
-
-    # 要約用API
     app.router.add_get("/api/ready", handle_api_ready)
     app.router.add_post("/api/summary", handle_api_summary)
 
@@ -333,20 +364,19 @@ async def start_web_server(bot: commands.Bot):
     await site.start()
 
 
+# 👇 ここから外側の関数（左端からスタートする）
 async def main_async() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
-
     token = os.environ.get("DISCORD_BOT_TOKEN")
     if not token:
         raise RuntimeError("DISCORD_BOT_TOKEN is not configured.")
-
+    
     bot = create_bot()
     await start_web_server(bot)
     await bot.start(token)
-
 
 if __name__ == "__main__":
     asyncio.run(main_async())
