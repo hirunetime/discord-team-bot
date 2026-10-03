@@ -4,9 +4,9 @@ import json
 import logging
 import os
 import random
+
 from aiohttp import web
 import aiohttp
-
 
 import discord
 from discord.ext import commands
@@ -27,6 +27,11 @@ SUMMARY_API_SECRET = os.environ.get("SUMMARY_API_SECRET", "")
 # Gemini API
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+
+
+class GeminiServiceUnavailableError(Exception):
+    """Geminiが一時的に利用できない場合の例外"""
+    pass
 
 
 async def get_poll_answer_users(answer) -> list[discord.User | discord.Member]:
@@ -81,7 +86,7 @@ async def run_team_division(bot: commands.Bot, size: int = None) -> tuple[bool, 
         dest_channel = bot.get_channel(RESULT_CHANNEL_ID)
         if dest_channel is None:
             dest_channel = await bot.fetch_channel(RESULT_CHANNEL_ID)
-        
+
         guild = dest_channel.guild
 
         # アンケートメッセージの取得
@@ -114,7 +119,7 @@ async def run_team_division(bot: commands.Bot, size: int = None) -> tuple[bool, 
 
         # ユーザー取得
         raw_users = await get_poll_answer_users(target_answer)
-        
+
         # Memberオブジェクトから「サーバー表示名（ニックネーム）」文字列を取得
         members = []
         for u in raw_users:
@@ -123,7 +128,7 @@ async def run_team_division(bot: commands.Bot, size: int = None) -> tuple[bool, 
 
             # 1. キャッシュからMemberを取得
             member = guild.get_member(u.id)
-            
+
             # 2. キャッシュになければAPIから取得
             if member is None:
                 try:
@@ -155,9 +160,9 @@ async def run_team_division(bot: commands.Bot, size: int = None) -> tuple[bool, 
             is_full = (len(t) == size)
             icon = "👥" if is_full else "⚠️"
             team_title = f"{icon} チーム {i}" if is_full else f"{icon} チーム {i}（余り {len(t)}名）"
-            
+
             member_list = "\n".join([f"> {m}" for m in t])
-            
+
             embed.add_field(
                 name=team_title,
                 value=member_list,
@@ -242,7 +247,7 @@ def build_gemini_prompt(messages: list[dict]) -> str:
 - 同じ大分類に属していても、別の出来事・別の話題なら別トピックにしてください。
 - 単なる挨拶や単独の短い相槌など、意味のある話題を形成しないメッセージは無理に独立した話題にしないでください。前後の文脈から明確な話題に属するなら、その話題へ含めてください。
 - 1つのメッセージは1つの話題にだけ数えてください。
-- 「message_count」は、その話題に分類したDiscordメッセージの実数です。
+- 「message_count」は、その話題に分類したDiscordメッセージ数です。
 - 「earliest_at」は、その話題に分類したメッセージの中で最も早い投稿時刻です。
 - message_countが多い話題を優先して上位15件を選んでください。
 - 最終的に15件を超えてはいけません。
@@ -266,30 +271,31 @@ Discordメッセージ:
 
 async def call_gemini(messages: list[dict]) -> list[dict]:
     if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY がRenderに設定されていません。")
+        raise RuntimeError(
+            "GEMINI_API_KEY がRenderに設定されていません。"
+        )
 
     prompt = build_gemini_prompt(messages)
 
     schema = {
-        "type": "OBJECT",
+        "type": "object",
         "properties": {
             "topics": {
-                "type": "ARRAY",
+                "type": "array",
                 "maxItems": 15,
                 "items": {
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
                         "message_count": {
-                            "type": "INTEGER",
+                            "type": "integer",
                             "description": "この話題に分類されたDiscordメッセージ数"
                         },
                         "earliest_at": {
-                            "type": "STRING",
-                            "format": "date-time",
+                            "type": "string",
                             "description": "この話題で最も早いメッセージのISO 8601時刻"
                         },
                         "summary": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "中学生にも分かる80〜110文字程度の日本語要約"
                         }
                     },
@@ -348,51 +354,96 @@ async def call_gemini(messages: list[dict]) -> list[dict]:
                 response.status
             )
 
+            # 503だけ専用処理
+            if response.status == 503:
+                logging.error(
+                    "Gemini API service unavailable: %s",
+                    response_text[:2000]
+                )
+
+                raise GeminiServiceUnavailableError(
+                    "Gemini APIが503 Service Unavailableを返しました。"
+                )
+
             if response.status < 200 or response.status >= 300:
                 logging.error(
                     "Gemini API error: HTTP %s / %s",
                     response.status,
                     response_text[:2000]
                 )
+
                 raise RuntimeError(
                     f"Gemini APIがHTTP {response.status}を返しました。"
                 )
 
             try:
-                response_data = json.loads(response_text)
+                response_data = json.loads(
+                    response_text
+                )
             except json.JSONDecodeError:
                 logging.error(
                     "Gemini APIレスポンスJSON解析失敗: %s",
                     response_text[:2000]
                 )
+
                 raise RuntimeError(
                     "Gemini APIのレスポンスを解析できませんでした。"
                 )
 
-    # Interactions APIのstepsから最終テキストを取得
-    output_text_parts = []
+    # APIの状態確認
+    interaction_status = response_data.get("status")
 
-    for step in response_data.get("steps", []):
-        if step.get("type") != "model_output":
-            continue
+    if interaction_status in (
+        "failed",
+        "cancelled",
+        "incomplete"
+    ):
+        logging.error(
+            "Gemini interaction status=%s response=%s",
+            interaction_status,
+            response_text[:2000]
+        )
 
-        for content in step.get("content", []):
-            if content.get("type") == "text":
-                text = content.get("text", "")
-                if text:
-                    output_text_parts.append(text)
+        raise RuntimeError(
+            f"Geminiの処理状態が {interaction_status} でした。"
+        )
 
-    output_text = "".join(output_text_parts).strip()
+    # Interactions APIの最終テキストを取得
+    output_text = ""
 
-    # 念のためSDK等で使われる形式にも対応
+    direct_output = response_data.get(
+        "output_text",
+        ""
+    )
+
+    if isinstance(direct_output, str):
+        output_text = direct_output.strip()
+
+    # output_textがない場合はstepsから探す
     if not output_text:
-        output_text = response_data.get("output_text", "").strip()
+        output_text_parts = []
+
+        for step in response_data.get("steps", []):
+            if step.get("type") != "model_output":
+                continue
+
+            for content in step.get("content", []):
+                if content.get("type") == "text":
+                    text = content.get("text", "")
+
+                    if text:
+                        output_text_parts.append(text)
+
+        output_text = "".join(
+            output_text_parts
+        ).strip()
 
     if not output_text:
         logging.error(
             "Geminiのテキスト出力がありません: %s",
             response_text[:2000]
         )
+
         raise RuntimeError(
             "Geminiから要約結果が返ってきませんでした。"
         )
@@ -407,15 +458,20 @@ async def call_gemini(messages: list[dict]) -> list[dict]:
             if lines[-1].strip().startswith("```"):
                 lines = lines[:-1]
 
-            output_text = "\n".join(lines).strip()
+            output_text = "\n".join(
+                lines
+            ).strip()
 
     try:
-        result = json.loads(output_text)
+        result = json.loads(
+            output_text
+        )
     except json.JSONDecodeError:
         logging.error(
             "Gemini出力JSON解析失敗: %s",
             output_text[:2000]
         )
+
         raise RuntimeError(
             "Geminiの出力をJSONとして解析できませんでした。"
         )
@@ -431,9 +487,17 @@ async def call_gemini(messages: list[dict]) -> list[dict]:
 
     for topic in topics[:15]:
         try:
-            count = int(topic["message_count"])
-            earliest_at = str(topic["earliest_at"])
-            summary = str(topic["summary"]).strip()
+            count = int(
+                topic["message_count"]
+            )
+
+            earliest_at = str(
+                topic["earliest_at"]
+            )
+
+            summary = str(
+                topic["summary"]
+            ).strip()
 
             if count < 1:
                 continue
@@ -449,7 +513,11 @@ async def call_gemini(messages: list[dict]) -> list[dict]:
                 }
             )
 
-        except (KeyError, TypeError, ValueError):
+        except (
+            KeyError,
+            TypeError,
+            ValueError
+        ):
             logging.warning(
                 "Geminiの話題データを1件スキップ: %s",
                 topic
@@ -469,8 +537,12 @@ async def call_gemini(messages: list[dict]) -> list[dict]:
 
         try:
             return datetime.datetime.fromisoformat(
-                value.replace("Z", "+00:00")
+                value.replace(
+                    "Z",
+                    "+00:00"
+                )
             )
+
         except ValueError:
             return datetime.datetime.max.replace(
                 tzinfo=datetime.timezone.utc
@@ -483,7 +555,10 @@ async def call_gemini(messages: list[dict]) -> list[dict]:
     return validated_topics
 
 
-def build_discord_summary(topics: list[dict]) -> str:
+def build_discord_summary(
+    topics: list[dict]
+) -> str:
+
     lines = [
         "直近12時間の要約"
     ]
@@ -491,67 +566,150 @@ def build_discord_summary(topics: list[dict]) -> str:
     for topic in topics:
         summary = topic["summary"]
 
-        # 1行あたりを短く保ち、Discordの2000文字制限を確実に避ける
-        summary = summary.replace("\r", " ")
-        summary = summary.replace("\n", " ")
+        summary = summary.replace(
+            "\r",
+            " "
+        )
+
+        summary = summary.replace(
+            "\n",
+            " "
+        )
+
         summary = summary.strip()
 
         if len(summary) > 110:
             summary = summary[:110] + "…"
 
         # メンションを発生させない
-        summary = summary.replace("@everyone", "@ everyone")
-        summary = summary.replace("@here", "@ here")
+        summary = summary.replace(
+            "@everyone",
+            "@ everyone"
+        )
+
+        summary = summary.replace(
+            "@here",
+            "@ here"
+        )
 
         lines.append(
             f"・{summary}"
         )
 
-    result = "\n".join(lines)
+    result = "\n".join(
+        lines
+    )
 
-    # 念のためDiscordの上限を超えないよう保険
+    # Discordの2000文字制限を確実に避ける
     if len(result) > 1900:
         result = result[:1897] + "..."
 
     return result
 
 
-async def start_web_server(bot: commands.Bot):
+async def start_web_server(
+    bot: commands.Bot
+):
     """APIリクエストを受け付けるWebサーバー"""
+
     async def handle_health(request):
-        return web.Response(text="Bot is running!")
+        return web.Response(
+            text="Bot is running!"
+        )
 
     async def handle_api_team(request):
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header != f"Bearer {API_SECRET_TOKEN}":
-            return web.json_response({"status": "error", "message": "Unauthorized"}, status=401)
+        auth_header = request.headers.get(
+            "Authorization",
+            ""
+        )
 
-        success, msg = await run_team_division(bot)
+        if auth_header != (
+            f"Bearer {API_SECRET_TOKEN}"
+        ):
+            return web.json_response(
+                {
+                    "status": "error",
+                    "message": "Unauthorized"
+                },
+                status=401
+            )
+
+        success, msg = await run_team_division(
+            bot
+        )
+
         if success:
-            return web.json_response({"status": "success", "message": msg})
+            return web.json_response(
+                {
+                    "status": "success",
+                    "message": msg
+                }
+            )
+
         else:
-            return web.json_response({"status": "error", "message": msg}, status=400)
+            return web.json_response(
+                {
+                    "status": "error",
+                    "message": msg
+                },
+                status=400
+            )
 
     # 要約API用：BotがDiscordに接続済みか確認
     async def handle_api_ready(request):
         if not bot.is_ready():
-            return web.json_response({"status": "not_ready"}, status=503)
+            return web.json_response(
+                {
+                    "status": "not_ready"
+                },
+                status=503
+            )
 
-        return web.json_response({"status": "ready"})
+        return web.json_response(
+            {
+                "status": "ready"
+            }
+        )
 
     # 要約API
     async def handle_api_summary(request):
-        auth_header = request.headers.get("Authorization", "")
+        auth_header = request.headers.get(
+            "Authorization",
+            ""
+        )
 
-        if not SUMMARY_API_SECRET or auth_header != f"Bearer {SUMMARY_API_SECRET}":
-            return web.json_response({"status": "error", "message": "Unauthorized"}, status=401)
+        if (
+            not SUMMARY_API_SECRET
+            or auth_header != (
+                f"Bearer {SUMMARY_API_SECRET}"
+            )
+        ):
+            return web.json_response(
+                {
+                    "status": "error",
+                    "message": "Unauthorized"
+                },
+                status=401
+            )
 
         try:
             data = await request.json()
-        except Exception:
-            return web.json_response({"status": "error", "message": "Invalid JSON"}, status=400)
 
-        required = ["request_id", "guild_id", "channel_id", "user_id"]
+        except Exception:
+            return web.json_response(
+                {
+                    "status": "error",
+                    "message": "Invalid JSON"
+                },
+                status=400
+            )
+
+        required = [
+            "request_id",
+            "guild_id",
+            "channel_id",
+            "user_id"
+        ]
 
         for key in required:
             if not data.get(key):
@@ -563,16 +721,27 @@ async def start_web_server(bot: commands.Bot):
                     status=400
                 )
 
-        request_id = str(data["request_id"])
-        guild_id = int(data["guild_id"])
-        channel_id = int(data["channel_id"])
+        request_id = str(
+            data["request_id"]
+        )
+
+        guild_id = int(
+            data["guild_id"]
+        )
+
+        channel_id = int(
+            data["channel_id"]
+        )
 
         logging.info(
-            "要約API受信: request_id=%s guild_id=%s channel_id=%s",
+            "要約API受信: "
+            "request_id=%s guild_id=%s channel_id=%s",
             request_id,
             guild_id,
             channel_id
         )
+
+        channel = None
 
         try:
             if not GEMINI_API_KEY:
@@ -581,13 +750,20 @@ async def start_web_server(bot: commands.Bot):
                 )
 
             # チャンネル取得
-            channel = bot.get_channel(channel_id)
+            channel = bot.get_channel(
+                channel_id
+            )
 
             if channel is None:
-                channel = await bot.fetch_channel(channel_id)
+                channel = await bot.fetch_channel(
+                    channel_id
+                )
 
             # スレッドは対象外
-            if isinstance(channel, discord.Thread):
+            if isinstance(
+                channel,
+                discord.Thread
+            ):
                 return web.json_response(
                     {
                         "status": "error",
@@ -597,7 +773,11 @@ async def start_web_server(bot: commands.Bot):
                 )
 
             # Guild確認
-            channel_guild = getattr(channel, "guild", None)
+            channel_guild = getattr(
+                channel,
+                "guild",
+                None
+            )
 
             if channel_guild is None:
                 return web.json_response(
@@ -640,11 +820,17 @@ async def start_web_server(bot: commands.Bot):
                     continue
 
                 # 通常メッセージ以外は除外
-                if message.type != discord.MessageType.default:
+                if (
+                    message.type
+                    != discord.MessageType.default
+                ):
                     continue
 
                 # 念のためスレッド投稿を除外
-                if isinstance(message.channel, discord.Thread):
+                if isinstance(
+                    message.channel,
+                    discord.Thread
+                ):
                     continue
 
                 # 本文が空のメッセージは対象外
@@ -654,15 +840,20 @@ async def start_web_server(bot: commands.Bot):
                 if not content:
                     continue
 
-                # 念のため12時間境界を再確認
+                # 12時間境界を再確認
                 if message.created_at < cutoff_time:
                     continue
 
                 messages.append(
                     {
-                        "created_at": message.created_at.isoformat(),
-                        "author": message.author.display_name,
-                        "content": content
+                        "created_at":
+                            message.created_at.isoformat(),
+
+                        "author":
+                            message.author.display_name,
+
+                        "content":
+                            content
                     }
                 )
 
@@ -675,12 +866,8 @@ async def start_web_server(bot: commands.Bot):
 
             # 対象メッセージがない場合
             if not messages:
-                no_message_text = (
-                    "過去12時間に要約対象のメッセージはありませんでした。"
-                )
-
                 await channel.send(
-                    no_message_text,
+                    "過去12時間に要約対象のメッセージはありませんでした。",
                     allowed_mentions=discord.AllowedMentions.none()
                 )
 
@@ -704,20 +891,17 @@ async def start_web_server(bot: commands.Bot):
             )
 
             logging.info(
-                "Gemini要約成功: request_id=%s topics=%d",
+                "Gemini要約成功: "
+                "request_id=%s topics=%d",
                 request_id,
                 len(topics)
             )
 
             # 要約できる話題がなかった場合
             if not topics:
-                no_topic_text = (
-                    "過去12時間のメッセージから、"
-                    "要約できる話題は見つかりませんでした。"
-                )
-
                 await channel.send(
-                    no_topic_text,
+                    "過去12時間のメッセージから、"
+                    "要約できる話題は見つかりませんでした。",
                     allowed_mentions=discord.AllowedMentions.none()
                 )
 
@@ -743,7 +927,8 @@ async def start_web_server(bot: commands.Bot):
             )
 
             logging.info(
-                "Discord要約投稿成功: request_id=%s topics=%d messages=%d",
+                "Discord要約投稿成功: "
+                "request_id=%s topics=%d messages=%d",
                 request_id,
                 len(topics),
                 len(messages)
@@ -759,23 +944,51 @@ async def start_web_server(bot: commands.Bot):
                 }
             )
 
+        # Gemini 503専用
+        except GeminiServiceUnavailableError:
+            logging.exception(
+                "Gemini 503による要約失敗: request_id=%s",
+                request_id
+            )
+
+            try:
+                if channel is not None:
+                    await channel.send(
+                        "Geminiが一時的な過負荷のため利用できませんでした。\n"
+                        "時間をおいて、もう一度 /要約 を実行してください。",
+                        allowed_mentions=discord.AllowedMentions.none()
+                    )
+
+            except Exception:
+                logging.exception(
+                    "Gemini 503のエラー通知投稿にも失敗しました"
+                )
+
+            return web.json_response(
+                {
+                    "status": "error",
+                    "error_type": "gemini_service_unavailable",
+                    "message": "Geminiが一時的に利用できませんでした。",
+                    "request_id": request_id
+                },
+                status=503
+            )
+
+        # その他のエラー
         except Exception as e:
             logging.exception(
                 "要約API実行エラー: request_id=%s",
                 request_id
             )
 
-            # ユーザーには詳細な内部エラーを見せない
-            error_text = (
-                "要約処理中にエラーが発生しました。\n"
-                f"依頼ID: {request_id}"
-            )
-
             try:
-                await channel.send(
-                    error_text,
-                    allowed_mentions=discord.AllowedMentions.none()
-                )
+                if channel is not None:
+                    await channel.send(
+                        "要約処理中にエラーが発生しました。\n"
+                        f"依頼ID: {request_id}",
+                        allowed_mentions=discord.AllowedMentions.none()
+                    )
+
             except Exception:
                 logging.exception(
                     "エラー通知のDiscord投稿にも失敗しました"
@@ -791,31 +1004,78 @@ async def start_web_server(bot: commands.Bot):
             )
 
     app = web.Application()
-    app.router.add_get("/", handle_health)
-    app.router.add_post("/api/team", handle_api_team)
-    app.router.add_get("/api/ready", handle_api_ready)
-    app.router.add_post("/api/summary", handle_api_summary)
 
-    runner = web.AppRunner(app)
+    # 既存API
+    app.router.add_get(
+        "/",
+        handle_health
+    )
+
+    app.router.add_post(
+        "/api/team",
+        handle_api_team
+    )
+
+    # 要約用API
+    app.router.add_get(
+        "/api/ready",
+        handle_api_ready
+    )
+
+    app.router.add_post(
+        "/api/summary",
+        handle_api_summary
+    )
+
+    runner = web.AppRunner(
+        app
+    )
+
     await runner.setup()
+
     port = 10000
-    site = web.TCPSite(runner, "0.0.0.0", port)
+
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        port
+    )
+
     await site.start()
 
 
-# 👇 ここから外側の関数（左端からスタートする）
 async def main_async() -> None:
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        format=(
+            "%(asctime)s | "
+            "%(levelname)s | "
+            "%(name)s | "
+            "%(message)s"
+        ),
     )
-    token = os.environ.get("DISCORD_BOT_TOKEN")
+
+    token = os.environ.get(
+        "DISCORD_BOT_TOKEN"
+    )
+
     if not token:
-        raise RuntimeError("DISCORD_BOT_TOKEN is not configured.")
-    
+        raise RuntimeError(
+            "DISCORD_BOT_TOKEN is not configured."
+        )
+
     bot = create_bot()
-    await start_web_server(bot)
-    await bot.start(token)
+
+    await start_web_server(
+        bot
+    )
+
+    await bot.start(
+        token
+    )
+
 
 if __name__ == "__main__":
-    asyncio.run(main_async())
+    asyncio.run(
+        main_async()
+    )
