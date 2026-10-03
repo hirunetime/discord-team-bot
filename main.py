@@ -217,39 +217,112 @@ async def start_web_server(bot: commands.Bot):
         else:
             return web.json_response({"status": "error", "message": msg}, status=400)
 
-    # 👇 ここから追加・修正（インデントを4つ空けて start_web_server の中に含める）
+    # 要約API用：BotがDiscordに接続済みか確認
     async def handle_api_ready(request):
         if not bot.is_ready():
             return web.json_response({"status": "not_ready"}, status=503)
+
         return web.json_response({"status": "ready"})
 
+    # 要約API
     async def handle_api_summary(request):
         auth_header = request.headers.get("Authorization", "")
+
         if not SUMMARY_API_SECRET or auth_header != f"Bearer {SUMMARY_API_SECRET}":
             return web.json_response({"status": "error", "message": "Unauthorized"}, status=401)
-        
+
         try:
             data = await request.json()
         except Exception:
             return web.json_response({"status": "error", "message": "Invalid JSON"}, status=400)
-        
+
         required = ["request_id", "guild_id", "channel_id", "user_id"]
+
         for key in required:
             if not data.get(key):
-                return web.json_response({"status": "error", "message": f"{key} がありません"}, status=400)
-        
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "message": f"{key} がありません"
+                    },
+                    status=400
+                )
+
         request_id = str(data["request_id"])
+        guild_id = int(data["guild_id"])
         channel_id = int(data["channel_id"])
-        
-        # TODO: サマリーの具体的な処理の続きがあればここに記述してください
-        
-        return web.json_response({"status": "success", "message": "Summary API OK"})
 
+        logging.info(
+            "要約API受信: request_id=%s guild_id=%s channel_id=%s",
+            request_id,
+            guild_id,
+            channel_id
+        )
 
-    # 👇 ルーティングの設定とサーバー起動
+        try:
+            # チャンネル取得
+            channel = bot.get_channel(channel_id)
+
+            if channel is None:
+                channel = await bot.fetch_channel(channel_id)
+
+            # Guild確認
+            channel_guild = getattr(channel, "guild", None)
+
+            if channel_guild is None:
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "message": "指定チャンネルを取得できませんでした"
+                    },
+                    status=400
+                )
+
+            if channel_guild.id != guild_id:
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "message": "Guild IDが一致しません"
+                    },
+                    status=400
+                )
+
+            # 接続テストとして、元の実行チャンネルへ投稿
+            await channel.send(
+                "要約処理の接続テストです。\n"
+                "Renderからこのチャンネルへの投稿に成功しました。"
+            )
+
+            logging.info(
+                "要約API接続テスト成功: request_id=%s channel_id=%s",
+                request_id,
+                channel_id
+            )
+
+            return web.json_response(
+                {
+                    "status": "success",
+                    "message": "Discordへの投稿に成功しました",
+                    "request_id": request_id
+                }
+            )
+
+        except Exception as e:
+            logging.exception("要約API実行エラー")
+
+            return web.json_response(
+                {
+                    "status": "error",
+                    "message": str(e)
+                },
+                status=500
+            )
+
     app = web.Application()
     app.router.add_get("/", handle_health)
     app.router.add_post("/api/team", handle_api_team)
+
+    # 要約用API
     app.router.add_get("/api/ready", handle_api_ready)
     app.router.add_post("/api/summary", handle_api_summary)
 
@@ -260,19 +333,20 @@ async def start_web_server(bot: commands.Bot):
     await site.start()
 
 
-# 👇 ここから外側の関数（左端からスタートする）
 async def main_async() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
+
     token = os.environ.get("DISCORD_BOT_TOKEN")
     if not token:
         raise RuntimeError("DISCORD_BOT_TOKEN is not configured.")
-    
+
     bot = create_bot()
     await start_web_server(bot)
     await bot.start(token)
+
 
 if __name__ == "__main__":
     asyncio.run(main_async())
